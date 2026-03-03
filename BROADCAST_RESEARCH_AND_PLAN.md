@@ -56,6 +56,27 @@ Relevant code areas:
 - **Callback security:** `X-CallbackToken` is sent by ARC as `Authorization: Bearer <token>` when calling the client's callback URL – so callbacks can be authenticated.
 - **No request signing:** There is no HMAC or other request-body signing in the codebase; security is limited to optional Bearer/API key and callback token.
 
+### 2.3 ARC does **not** validate transactions against the UTXO set
+
+**Conclusion:** ARC does **not** check that transaction inputs reference unspent outputs (no UTXO-set validation). Double-spend and “already spent” are detected only when the **Bitcoin node** rejects the transaction (e.g. via ZMQ or P2P), not at ARC’s API or validator.
+
+**Evidence:**
+
+1. **ARC’s own documentation** (`arc/doc/README.md`):
+   - *"Obviously, double spending (for example) cannot be checked without an updated utxo set, and it is assumed that the API does not have this data."*
+   - *"Therefore, the 'validator' sub-function within the API filters as much as it can to reduce spurious transactions passing through the pipeline but leaves others for the bitcoin nodes themselves."*
+   - *"The actual utxos are left to be checked by the Bitcoin node itself."*
+
+2. **What the API validator does:**
+   - **extendTx** (defaultvalidator/helpers.go): Fetches **parent transactions** via `TxFinder.GetRawTxs()` (TransactionHandler, Node, or WoC) to fill in prevout script and value for each input. That only provides the *content* of the referenced output from the parent tx; it does **not** check that the output is still unspent.
+   - **CommonValidateTransaction** (validator/common_validation.go): Structure/syntax only (size, empty inputs/outputs, coinbase check, sigops, push-only, etc.). No UTXO lookup.
+   - **Fee / script validation:** Use the prevout data from the extended tx (sum of inputs vs outputs, script execution). Script verification runs against the *claimed* prevout from the parent tx; it does not verify that the referenced output still exists in the UTXO set.
+   - So: **no** “is this outpoint still unspent?” check; double-spend is **not** detected at validation time.
+
+3. **Metamorph:** Defines a `BitcoinNode` interface with `GetTxOut(txHex, vout, includeMempool)` (server.go), but the Processor does **not** take or use a BitcoinNode; `GetTxOut` is never called in the broadcast/validation path. Double-spend status (e.g. `DOUBLE_SPEND_ATTEMPTED`) comes from **ZMQ** messages from the node (`invalidtx` / discarded from mempool), i.e. after the node has rejected the tx.
+
+4. **Implication for “signed and secure” broadcast:** If you need pre-broadcast assurance that inputs are unspent, that logic would have to be added (e.g. call a node’s `gettxout` or equivalent, or integrate with Teranode’s validator/UTXO store). Today, ARC intentionally leaves UTXO checks to the node.
+
 ---
 
 ## 3. Teranode – broadcast capabilities
@@ -177,10 +198,74 @@ So the plan should focus on **ARC** as the place to implement and enforce signed
 
 ---
 
-## 7. Recommendation summary
+## 7. Validate-only (simulate) flag & Teranode Validator for UTXO check
+
+**Goal:** Add an ARC option to run **simulate-validation only** (no broadcast), so callers can check that a transaction would pass validation—including **UTXO spent status**—without submitting to the network. Teranode is intended to support direct API access with signed responses for secure, attestable validation.
+
+### 7.1 Feasibility in ARC
+
+**Adding a validate-only / simulate flag is straightforward.**
+
+- **Current flow** (e.g. `POST /v1/tx`, `POST /v1/txs`):  
+  `getTxDataFromHex` (decode + ARC validation) → `submitTransactions` (TransactionHandler → Metamorph or BitcoinNode).  
+  So “validate only” means: run decode + ARC validation as today, then **skip** `submitTransactions` and return a structured “validation only” response (e.g. valid/invalid per tx, optional reason).
+
+- **Where to hook the flag:**
+  - Add a header (e.g. **`X-ValidateOnly`** or **`X-SimulateValidation`**) and map it into `global.TransactionOptions` (e.g. `ValidateOnly bool`), same pattern as `X-SkipTxValidation`, `X-ForceValidation`, etc. (see `getTransactionsOptions` in `internal/api/handler/default.go`).
+  - In `processTransactions`, after `getTxDataFromHex` succeeds, if `options.ValidateOnly` is true: **do not call** `submitTransactions`; instead return a response that indicates “validation only” (e.g. success with a synthetic status like `VALIDATION_ONLY` or a dedicated response shape with `valid: true/false`, `reason` per tx).
+
+- **ARC’s own validation** (structure, fee, script from parent tx data) already runs in `getTxDataFromHex`. So with only this change, “validate only” gives you **no broadcast** and **no UTXO check** (ARC still does not have UTXO set). To get **UTXO spent status** in the same call, ARC would need to call an external validator (e.g. Teranode) when the flag is set—see below.
+
+### 7.2 Teranode Validator for UTXO check (simulate only, no broadcast)
+
+Teranode’s **Validator** gRPC API is a good fit for “validate only, including UTXO” without broadcasting.
+
+- **API** (from [Validator Proto](https://bsv-blockchain.github.io/teranode/references/protobuf_docs/validatorProto/)):
+  - **`ValidateTransaction(ValidateTransactionRequest) → ValidateTransactionResponse`**  
+    “Performs comprehensive validation including script verification and **UTXO checks**.”
+  - **`ValidateTransactionBatch`** for multiple transactions.
+
+- **Request fields relevant to “simulate only” (spend-simulation):**
+  - **`add_tx_to_block_assembly`** (optional bool): Set to **false** so the validated tx is **not** added to block assembly → no broadcast, no mining path. This is the only flag needed for “validate only, no broadcast.”
+  - **`skip_utxo_creation`** (optional bool): Do **not** set this to true for spend-simulation. “Skip UTXO creation” means skip creating/persisting new UTXOs from this tx’s outputs; in some implementations that could also skip or alter the **input** UTXO spent check. We need the validator to perform the full **UTXO spent status check** (inputs unspent) and return success/fail. So use **`add_tx_to_block_assembly: false`** only, and leave **`skip_utxo_creation`** false or omitted so the node still runs the full validation including UTXO spent checks.
+
+- **Response:** `valid` (bool), `txid`, `reason` (rejection reason if invalid), `metadata`. That gives ARC (and the client) a clear “would this pass the node’s UTXO + script checks?” result.
+
+**Integration with ARC:** When `X-ValidateOnly` is true and a Teranode Validator endpoint is configured, ARC could:
+
+1. Run its own validation as today (`getTxDataFromHex`).
+2. For each decoded tx, call Teranode’s `ValidateTransaction` (or batch) with **`add_tx_to_block_assembly=false`** only (do not set `skip_utxo_creation=true`, so the validator still performs the full UTXO spent check).
+3. Return a combined response: ARC validation result + Teranode validation result (valid/reason), **without** calling `submitTransactions`.
+
+That way the client gets a single “simulate only” response that includes UTXO spent status when Teranode is used.
+
+### 7.3 Teranode security: direct API comms and signed responses
+
+- **gRPC API key auth (documented):**  
+  Teranode’s RPC reference describes **gRPC API key authentication** for certain operations: API key in gRPC metadata **`x-api-key`**; configurable via e.g. `grpc_admin_api_key`. So direct gRPC access to Teranode (including Validator) can be authenticated with an API key. Use TLS for the gRPC channel so the response is not visible on the wire.
+
+- **“Signed responses”:**  
+  The phrase “direct API comms with signed responses” could mean:
+  - **TLS:** The entire gRPC response is integrity-protected (and confidential) over the channel; no separate payload signature.
+  - **Application-level response signing:** The Validator (or another service) signs the response payload (e.g. `valid` + `txid` + `reason`) so the client can prove what the node said. That would require support in Teranode’s Validator (or gateway) and is not clearly documented in the references we have.  
+  **Recommendation:** Confirm with Teranode docs or code whether Validator (or any gRPC service) returns a signature over the response body. If not, “signed” can be satisfied by TLS + API key for now; response-signing could be a follow-up.
+
+- **Secure pattern for ARC → Teranode Validator:**  
+  Use TLS for the gRPC connection and, if the Validator supports it, send `x-api-key` (or the configured auth) in metadata. That gives authenticated, confidential “validate only” calls. If Teranode adds response signing later, ARC can verify and optionally forward that to the client.
+
+### 7.4 Summary
+
+- **ARC:** Adding a flag (e.g. **`X-ValidateOnly`**) that skips `submitTransactions` and returns a “validation only” result is **feasible** and fits the existing options/flow.
+- **UTXO spent status:** Use Teranode’s **Validator** gRPC with **`ValidateTransaction`** (or batch) and **`add_tx_to_block_assembly=false`** only. Do not set `skip_utxo_creation=true` (that could skip the input spent check); keep it false/omitted so the node returns a spend-simulation success/fail including UTXO spent checks, without broadcasting.
+- **Security:** Teranode supports gRPC API key auth (`x-api-key`); run over TLS. Clarify with Teranode whether “signed responses” means payload signing; if not, TLS + auth is the baseline for secure validate-only calls.
+
+---
+
+## 8. Recommendation summary
 
 - **Implement signed and secure broadcast in ARC:** Enable configurable auth (Bearer/API key), optionally add request signing, and serve over TLS. Use the existing OpenAPI security schemes and example middleware.
 - **Use Teranode as the node when needed:** Connect ARC to Teranode via RPC (and later optionally Propagation) with Teranode's existing auth and TLS.
+- **Validate-only for UTXO check:** Add **`X-ValidateOnly`** (or similar) in ARC; when set, skip broadcast and optionally call Teranode Validator with `add_tx_to_block_assembly=false` to return UTXO/spent-status in the response.
 - **Do not duplicate:** Avoid building a full ARC-style status/callback and auth layer inside Teranode; keep Teranode as the chain/node and ARC as the broadcast/status API.
 
 This gives one clear place (ARC) for "signed and secure" broadcast while reusing both codebases according to their roles.

@@ -1,0 +1,4 @@
+# Vendored source repos (cloned for reference; each has .gitold for its own history)
+arc/
+teranode/
+arcade/
